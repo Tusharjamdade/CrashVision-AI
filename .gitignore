@@ -1,0 +1,8 @@
+# MLflow
+/mlflow/
+
+# ML files/data
+/ml/
+
+# Frontend dependencies
+/frontend/node_modules/
