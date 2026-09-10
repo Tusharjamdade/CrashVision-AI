@@ -6,3 +6,6 @@
 
 # Frontend dependencies
 /frontend/node_modules/
+/backend/.env
+/backend/recordings/
+/backend/__pycache__/
