@@ -5,6 +5,8 @@ import base64
 import asyncio
 import uuid
 import io
+import subprocess
+import shutil
 from collections import deque
 from pathlib import Path
 from threading import Lock, Thread
@@ -68,6 +70,16 @@ FRONTEND_ORIGINS = [
     if origin.strip()
 ]
 
+# Detect whether ffmpeg is available for proper H.264 encoding
+FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
+if FFMPEG_AVAILABLE:
+    print("ffmpeg detected — videos will be encoded as H.264 (browser-compatible).")
+else:
+    print(
+        "WARNING: ffmpeg not found. Falling back to OpenCV mp4v codec.\n"
+        "Videos may not play in browsers. Install ffmpeg for full compatibility."
+    )
+
 
 # ============================================================
 # Startup validation
@@ -109,15 +121,6 @@ app.add_middleware(
 
 # ============================================================
 # AWS S3
-#
-# The recommended approach is to keep the bucket PRIVATE and
-# give the frontend temporary presigned URLs.
-#
-# boto3 automatically reads:
-# AWS_ACCESS_KEY_ID
-# AWS_SECRET_ACCESS_KEY
-# AWS_REGION
-# from the environment/.env.
 # ============================================================
 
 s3 = boto3.client(
@@ -170,14 +173,6 @@ def s3_presigned_url(key: Optional[str]) -> Optional[str]:
 
 # ============================================================
 # MongoDB
-#
-# Collections:
-#   accident_records
-#       One document per detected accident.
-#
-#   chat_messages
-#       Persistent chat history. Each message belongs to:
-#       record_id + conversation_id
 # ============================================================
 
 mongo_client = MongoClient(MONGODB_URI)
@@ -197,13 +192,7 @@ def utc_now() -> datetime:
 
 
 def serialize_record(record: dict) -> dict:
-    """Convert MongoDB document into a frontend-friendly JSON object.
-
-    IMPORTANT:
-    MongoDB's _id is an internal ObjectId. The frontend must use the
-    application-level record_id UUID because /api/records/{record_id}
-    searches MongoDB using the record_id field.
-    """
+    """Convert MongoDB document into a frontend-friendly JSON object."""
     record_id = record.get("record_id") or str(record["_id"])
 
     result = {
@@ -506,43 +495,130 @@ def read_frame():
 # S3 evidence creation
 # ============================================================
 
-def encode_video(frames) -> bytes:
+def _encode_video_ffmpeg(frames, temp_dir: Path) -> bytes:
+    """
+    Encode frames to a browser-compatible H.264 MP4 using ffmpeg.
+
+    Strategy:
+      1. Write each frame as a JPEG into a temp folder.
+      2. Call ffmpeg to read the image sequence and output an H.264 MP4
+         with the 'faststart' flag so the moov atom is at the front of
+         the file — required for S3 streaming / in-browser playback.
+      3. Read the resulting file and return its bytes.
+    """
+    frames_dir = temp_dir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, frame in enumerate(frames):
+        frame_path = frames_dir / f"frame_{idx:06d}.jpg"
+        cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    output_path = temp_dir / "output.mp4"
+
+    # H.264 + AAC (no audio) with moov atom at start for HTTP streaming.
+    # -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" ensures even pixel dimensions
+    # which libx264 requires.
+    cmd = [
+        "ffmpeg",
+        "-y",                            # overwrite without prompt
+        "-framerate", str(FPS),
+        "-i", str(frames_dir / "frame_%06d.jpg"),
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",                    # quality (18=best, 28=worst)
+        "-pix_fmt", "yuv420p",           # required for broad browser support
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # force even dimensions
+        "-movflags", "+faststart",       # moov atom first → enables streaming
+        "-an",                           # no audio track
+        str(output_path),
+    ]
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    if result.returncode != 0:
+        stderr_text = result.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"ffmpeg encoding failed:\n{stderr_text}")
+
+    data = output_path.read_bytes()
+    return data
+
+
+def _encode_video_opencv(frames, temp_dir: Path) -> bytes:
+    """
+    Fallback encoder using OpenCV.
+
+    Uses the avc1 (H.264) FourCC when the codec is available on the
+    platform, otherwise falls back to mp4v.  avc1 produces files that
+    browsers can play; mp4v usually cannot be played inside a <video> tag.
+    """
     if not frames:
         raise ValueError("No frames to encode.")
 
     height, width = frames[0].shape[:2]
+    # Ensure even dimensions (required by H.264)
+    width = width if width % 2 == 0 else width - 1
+    height = height if height % 2 == 0 else height - 1
 
-    # Encode to a temporary local file because OpenCV's VideoWriter
-    # needs a seekable video file before we upload it to S3.
-    temp_dir = BASE_DIR / "tmp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    output_path = temp_dir / "output.mp4"
 
-    temp_path = temp_dir / f"{uuid.uuid4().hex}.mp4"
-
-    writer = cv2.VideoWriter(
-        str(temp_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        FPS,
-        (width, height),
-    )
-
-    if not writer.isOpened():
-        raise RuntimeError("Could not create MP4 video.")
+    # Try H.264 first; fall back to mp4v if unavailable.
+    for fourcc_str in ("avc1", "mp4v"):
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+        writer = cv2.VideoWriter(
+            str(output_path),
+            fourcc,
+            FPS,
+            (width, height),
+        )
+        if writer.isOpened():
+            print(f"OpenCV VideoWriter using codec: {fourcc_str}")
+            break
+        writer.release()
+    else:
+        raise RuntimeError("Could not initialise any OpenCV VideoWriter codec.")
 
     try:
         for frame in frames:
-            writer.write(frame)
+            # Resize to even dimensions if needed
+            resized = cv2.resize(frame, (width, height))
+            writer.write(resized)
     finally:
         writer.release()
 
-    data = temp_path.read_bytes()
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("OpenCV produced an empty video file.")
+
+    return output_path.read_bytes()
+
+
+def encode_video(frames) -> bytes:
+    """
+    Encode a list of OpenCV frames into a browser-playable H.264 MP4.
+
+    Prefers ffmpeg (full H.264 + moov-at-front) when available.
+    Falls back to OpenCV otherwise.
+    """
+    if not frames:
+        raise ValueError("No frames to encode.")
+
+    temp_dir = BASE_DIR / "tmp" / uuid.uuid4().hex
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        temp_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    return data
+        if FFMPEG_AVAILABLE:
+            return _encode_video_ffmpeg(frames, temp_dir)
+        else:
+            return _encode_video_opencv(frames, temp_dir)
+    finally:
+        # Always clean up temp files regardless of success or failure.
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def encode_image(frame) -> bytes:
@@ -955,6 +1031,7 @@ def health():
         "s3_error": s3_error,
         "s3_bucket": S3_BUCKET_NAME,
         "aws_region": AWS_REGION,
+        "ffmpeg_available": FFMPEG_AVAILABLE,
         "accident_model": ACCIDENT_MODEL_PATH.name,
         "detector_model": DETECTOR_MODEL_PATH.name,
     }
