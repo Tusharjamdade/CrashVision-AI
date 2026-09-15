@@ -22,6 +22,7 @@ AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1").strip()
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "crashvision-ai-337169763677-ap-south-1-an").strip()
+S3_MODEL_BUCKET_NAME = os.getenv("S3_MODEL_BUCKET_NAME", "crashvision-models-337169763677-ap-south-1").strip()
 
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB = os.getenv("MONGODB_DB", "crashvision")
@@ -52,13 +53,5 @@ FRONTEND_ORIGINS = [
 FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 
 # Startup validations
-if not ACCIDENT_MODEL_PATH.exists():
-    raise FileNotFoundError(f"Accident model not found: {ACCIDENT_MODEL_PATH}")
-
-if not DETECTOR_MODEL_PATH.exists():
-    raise FileNotFoundError(f"Object detector not found: {DETECTOR_MODEL_PATH}")
-
-if not S3_BUCKET_NAME:
-    S3_BUCKET_NAME = "crashvision-ai-337169763677-ap-south-1-an"
-
+ACCIDENT_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
 Path(BASE_DIR / "recordings").mkdir(parents=True, exist_ok=True)
